@@ -222,6 +222,9 @@ int main(int argc, char **argv) {
         fprintf(stderr, "Failed to allocate netlink socket\n");
         return 1;
     }
+    
+    // Disable sequence number checking for multicast messages
+    nl_socket_disable_seq_check(sk);
 
     // Connect to Generic Netlink
     err = genl_connect(sk);
@@ -318,40 +321,59 @@ int main(int argc, char **argv) {
     // on some systems if scans are not immediately available. sleep(2); // e.g.
     // printf("Waiting a moment for scan to initiate...\n"); // Removed, new loop has its own message
 
-    // Register callback (moved after trigger, uses &cb_data)
+    // Register callback before sending trigger scan
     nl_socket_modify_cb(sk, NL_CB_VALID, NL_CB_CUSTOM, scan_results_handler, &cb_data);
+    nl_socket_modify_cb(sk, NL_CB_ACK, NL_CB_CUSTOM, scan_results_handler, &cb_data);
+    nl_socket_modify_cb(sk, NL_CB_FINISH, NL_CB_CUSTOM, scan_results_handler, &cb_data);
 
-    // New Main Receive Loop
+    // New Main Receive Loop with Timeout
     printf("Waiting for scan finished event...\n");
     int recv_ret;
+    int timeout = 10000; // 10 seconds timeout
+    nl_socket_set_nonblocking(sk);
+    
+    struct timeval tv;
+    fd_set readfds;
+    int fd = nl_socket_get_fd(sk);
+    int received_something = 0;
+    
     // Loop while the scan event hasn't been processed OR 
-    // while a dump has been requested but hasn't completed (signaled by NL_STOP from callback).
-    // The callback returns NL_STOP on NLMSG_DONE, which causes nl_recvmsgs_default to return an error code NL_STOPPED.
+    // while a dump has been requested but hasn't completed.
     while (!cb_data.scan_event_processed || cb_data.dump_requested) {
-        recv_ret = nl_recvmsgs_default(sk);
-        if (recv_ret < 0) {
-            if (recv_ret == NL_STOP) { // NL_STOPPED means callback returned NL_STOP
-                printf("Main: Receiver stopped by callback (NL_STOP), likely scan dump complete.\n");
-                // If dump was requested and we got NL_STOP, it means NLMSG_DONE was handled.
-                // Reset dump_requested as callback would have done if it saw NLMSG_DONE.
-                if (cb_data.dump_requested) cb_data.dump_requested = 0; 
-                break; 
+        FD_ZERO(&readfds);
+        FD_SET(fd, &readfds);
+        tv.tv_sec = timeout / 1000;
+        tv.tv_usec = (timeout % 1000) * 1000;
+        
+        int select_ret = select(fd + 1, &readfds, NULL, NULL, &tv);
+        if (select_ret < 0) {
+            fprintf(stderr, "Main: select() error: %s\n", strerror(errno));
+            break;
+        } else if (select_ret == 0) {
+            fprintf(stderr, "Main: Timeout waiting for scan results (%d ms)\n", timeout);
+            break;
+        }
+        
+        if (FD_ISSET(fd, &readfds)) {
+            recv_ret = nl_recvmsgs_default(sk);
+            if (recv_ret < 0) {
+                if (recv_ret == -NLE_AGAIN) {
+                    continue; // No message yet, loop again if within timeout
+                } else if (recv_ret == NL_STOP) {
+                    printf("Main: Receiver stopped by callback (NL_STOP), likely scan dump complete.\n");
+                    if (cb_data.dump_requested) cb_data.dump_requested = 0;
+                    break;
+                } else {
+                    fprintf(stderr, "Main: nl_recvmsgs_default error: %s\n", nl_geterror(recv_ret));
+                    break;
+                }
             }
-            // For blocking sockets, NLE_AGAIN is not expected unless some timeout was set on the socket.
-            // Treat other negative values as errors.
-            fprintf(stderr, "Main: nl_recvmsgs_default error: %s\n", nl_geterror(recv_ret)); // Using nl_geterror
-            break; 
+            received_something = 1;
         }
-        if (recv_ret == 0 && !cb_data.scan_event_processed) {
-             // For a blocking socket, recv_ret=0 typically means the peer has closed the connection.
-             // This is unexpected in this Netlink scenario before scan event.
-             fprintf(stderr, "Main: No message received (recv_ret=0) and scan event not processed. Peer closed? Exiting.\n");
-             break;
-        }
-        // If scan_event_processed becomes true, and dump_requested becomes true, 
-        // the loop continues until the callback returns NL_STOP (on NLMSG_DONE).
-        // If scan_event_processed is true, but dump_requested is false (meaning dump send failed in callback),
-        // this loop will also exit because !cb_data.dump_requested will be false.
+    }
+    
+    if (!received_something) {
+        fprintf(stderr, "Main: No messages received during timeout period.\n");
     }
 
     // After the loop, check the final state of flags
