@@ -9,8 +9,15 @@
 #include <netlink/genl/ctrl.h>
 #include <linux/nl80211.h>
 #include <netlink/attr.h> // Needed for nla_parse, nla_data, etc.
-// Include netlink/error.h for nl_perror if that was the choice,
-// but sticking to fprintf and strerror for now.
+#include <netlink/error.h> // For nl_geterror()
+
+struct callback_data {
+    struct nl_sock *sock;       // Netlink socket for sending messages from callback
+    int nl80211_id;             // nl80211 family ID
+    int ifindex;                // Interface index
+    int scan_event_processed;   // Flag: 1 if NL80211_CMD_NEW_SCAN_RESULTS event has been processed
+    int dump_requested;         // Flag: 1 if NL80211_CMD_GET_SCAN (dump) has been sent
+};
 
 static void parse_ies(unsigned char *ies, int ies_len, char *ssid_buf, size_t ssid_buf_len) {
     ssid_buf[0] = '\0'; // Initialize to empty string
@@ -48,83 +55,141 @@ static void parse_ies(unsigned char *ies, int ies_len, char *ssid_buf, size_t ss
 static void parse_ies(unsigned char *ies, int ies_len, char *ssid_buf, size_t ssid_buf_len);
 
 static int scan_results_handler(struct nl_msg *msg, void *arg) {
+    struct callback_data *cb_data = (struct callback_data *)arg;
     struct nlmsghdr *nlh = nlmsg_hdr(msg);
-    // Correctly get the generic netlink header:
-    // The payload of the netlink message (nlmsg_data(nlh)) IS the generic netlink header.
     struct genlmsghdr *gnlh = nlmsg_data(nlh);
 
-    struct nlattr *tb[NL80211_ATTR_MAX + 1];
-    struct nlattr *bss_tb[NL80211_BSS_MAX + 1];
-    char ssid_str[128] = {0}; // Buffer for SSID, ensure it's enough (SSID max 32 chars)
-    char mac_addr_str[18]; // For BSSID: XX:XX:XX:XX:XX:XX + null
-
-    // Parse the top-level attributes from the generic netlink message
-    // The attributes start after the generic netlink header (gnlh).
-    // genlmsg_attrdata gets a pointer to the first attribute
-    // genlmsg_attrlen gets the length of the attribute area
-    if (nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
-                  genlmsg_attrlen(gnlh, 0), NULL) < 0) {
-        // Added error check for nla_parse
-        fprintf(stderr, "Failed to parse top-level netlink attributes\n");
-        return NL_SKIP;
-    }
-
-
-    if (!tb[NL80211_ATTR_BSS]) {
-        // This can happen, e.g. if the scan found nothing or message is not a result dump
-        // Or if it's a NLMSG_DONE message at the end of a dump.
-        // Check nlmsg_type if more specific handling is needed.
-        // For now, just indicate if BSS is missing when expected.
-        // fprintf(stderr, "BSS attribute missing from scan results message type %d\n", nlh->nlmsg_type);
-        return NL_OK; // NL_OK to continue processing other messages in a multi-message response
-    }
-
-    // NL80211_ATTR_BSS is a nested attribute containing BSS information
-    if (nla_parse_nested(bss_tb, NL80211_BSS_MAX, tb[NL80211_ATTR_BSS], NULL)) {
-        fprintf(stderr, "Failed to parse nested BSS attributes\n");
-        return NL_SKIP;
-    }
-
-    printf("\n--- Found BSS ---\n");
-
-    if (bss_tb[NL80211_BSS_BSSID]) {
-        unsigned char *mac = nla_data(bss_tb[NL80211_BSS_BSSID]);
-        snprintf(mac_addr_str, sizeof(mac_addr_str), "%02x:%02x:%02x:%02x:%02x:%02x",
-                 mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
-        printf("BSSID: %s\n", mac_addr_str);
-    }
-
-    if (bss_tb[NL80211_BSS_FREQUENCY]) {
-        printf("Frequency: %u MHz\n", nla_get_u32(bss_tb[NL80211_BSS_FREQUENCY]));
-    }
-
-    if (bss_tb[NL80211_BSS_SIGNAL_MBM]) {
-        // Signal is in mBm (100 * dBm)
-        printf("Signal: %.2f dBm\n", (float)nla_get_s32(bss_tb[NL80211_BSS_SIGNAL_MBM]) / 100.0);
-    }
-    
-    if (bss_tb[NL80211_BSS_STATUS]) {
-        uint32_t status = nla_get_u32(bss_tb[NL80211_BSS_STATUS]);
-        printf("Status: %u (", status);
-        if (status == NL80211_BSS_STATUS_ASSOCIATED) printf("Associated");
-        else if (status == NL80211_BSS_STATUS_AUTHENTICATED) printf("Authenticated");
-        else if (status == NL80211_BSS_STATUS_IBSS_JOINED) printf("IBSS Joined");
-        else printf("Other");
-        printf(")\n");
-    }
-
-    if (bss_tb[NL80211_BSS_INFORMATION_ELEMENTS]) {
-        unsigned char *ies_data = nla_data(bss_tb[NL80211_BSS_INFORMATION_ELEMENTS]);
-        int ies_len = nla_len(bss_tb[NL80211_BSS_INFORMATION_ELEMENTS]);
-        parse_ies(ies_data, ies_len, ssid_str, sizeof(ssid_str));
-        if (ssid_str[0] != '\0') {
-            printf("SSID: %s\n", ssid_str);
+    // Handle NLMSG_DONE to stop processing after a dump
+    if (nlh->nlmsg_type == NLMSG_DONE) {
+        if (cb_data->dump_requested) {
+            printf("Callback: Scan dump complete (NLMSG_DONE received).\n");
+            cb_data->dump_requested = 0; // Reset flag
         } else {
-            printf("SSID: (hidden or not found)\n");
+            // This might happen if NLMSG_DONE is received unexpectedly
+            // printf("Callback: NLMSG_DONE received unexpectedly.\n");
         }
+        return NL_STOP; // Stop nl_recvmsgs_default loop
     }
 
-    return NL_OK; // Important to return NL_OK to continue processing dump messages
+    // Check if it's an nl80211 command
+    if (nlh->nlmsg_type != cb_data->nl80211_id) {
+        // Not an nl80211 message, can skip or log
+        // printf("Callback: Received non-nl80211 message type %d\n", nlh->nlmsg_type);
+        return NL_OK;
+    }
+
+    // If it's the initial "scan finished" event
+    if (gnlh->cmd == NL80211_CMD_NEW_SCAN_RESULTS && !cb_data->scan_event_processed) {
+        printf("Callback: Scan finished event (NL80211_CMD_NEW_SCAN_RESULTS) received. Requesting dump of results.\n");
+        cb_data->scan_event_processed = 1; // Mark event as processed
+
+        struct nl_msg *dump_msg = nlmsg_alloc();
+        if (!dump_msg) {
+            fprintf(stderr, "Callback: Failed to allocate message for scan dump\n");
+            return NL_SKIP; // Or NL_STOP if it's critical
+        }
+
+        if (!genlmsg_put(dump_msg, NL_AUTO_PORT, NL_AUTO_SEQ, cb_data->nl80211_id, 0,
+                         NLM_F_REQUEST | NLM_F_DUMP, NL80211_CMD_GET_SCAN, 0)) {
+            fprintf(stderr, "Callback: Failed to put genlmsg for get scan dump\n");
+            nlmsg_free(dump_msg);
+            return NL_SKIP; // Or NL_STOP
+        }
+
+        if (nla_put_u32(dump_msg, NL80211_ATTR_IFINDEX, cb_data->ifindex) != 0) {
+            fprintf(stderr, "Callback: Failed to add ifindex attribute for scan dump\n");
+            nlmsg_free(dump_msg);
+            return NL_SKIP; // Or NL_STOP
+        }
+
+        int ret = nl_send_auto(cb_data->sock, dump_msg); // dump_msg is consumed by nl_send_auto
+        if (ret < 0) {
+            fprintf(stderr, "Callback: Failed to send get scan dump message: %s\n", strerror(-ret));
+            // No nlmsg_free here, nl_send_auto handles it.
+            // Depending on the error, we might want to NL_STOP.
+            return NL_SKIP;
+        }
+        cb_data->dump_requested = 1; // Indicate that GET_SCAN has been sent
+        printf("Callback: Scan dump request sent successfully.\n");
+        return NL_OK; // Continue to receive messages (i.e., the dump results)
+    }
+
+    // If a dump has been requested and this is an NL80211_CMD_NEW_SCAN_RESULTS message,
+    // it's a BSS entry from the dump.
+    if (cb_data->dump_requested && gnlh->cmd == NL80211_CMD_NEW_SCAN_RESULTS) {
+        // Existing BSS parsing logic (from the previous version of this function) goes here:
+        struct nlattr *tb[NL80211_ATTR_MAX + 1];
+        struct nlattr *bss_tb[NL80211_BSS_MAX + 1];
+        char ssid_str[128] = {0};
+        char mac_addr_str[18];
+
+        if (nla_parse(tb, NL80211_ATTR_MAX, genlmsg_attrdata(gnlh, 0),
+                      genlmsg_attrlen(gnlh, 0), NULL) < 0) {
+            fprintf(stderr, "Callback: Failed to parse top-level netlink attributes for BSS entry\n");
+            return NL_SKIP;
+        }
+
+        if (!tb[NL80211_ATTR_BSS]) {
+            // This might happen for non-BSS messages within the dump or if something is wrong.
+            // For a simple dumper, we might just ignore it if it's not a BSS.
+            // fprintf(stderr, "Callback: BSS attribute missing in dump message for type %d, cmd %d.\n", nlh->nlmsg_type, gnlh->cmd);
+            return NL_OK;
+        }
+
+        if (nla_parse_nested(bss_tb, NL80211_BSS_MAX, tb[NL80211_ATTR_BSS], NULL)) {
+            fprintf(stderr, "Callback: Failed to parse nested BSS attributes\n");
+            return NL_SKIP;
+        }
+
+        printf("\n--- Found BSS (from dump) ---\n");
+
+        if (bss_tb[NL80211_BSS_BSSID]) {
+            unsigned char *mac = nla_data(bss_tb[NL80211_BSS_BSSID]);
+            snprintf(mac_addr_str, sizeof(mac_addr_str), "%02x:%02x:%02x:%02x:%02x:%02x",
+                     mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+            printf("BSSID: %s\n", mac_addr_str);
+        }
+
+        if (bss_tb[NL80211_BSS_FREQUENCY]) {
+            printf("Frequency: %u MHz\n", nla_get_u32(bss_tb[NL80211_BSS_FREQUENCY]));
+        }
+
+        if (bss_tb[NL80211_BSS_SIGNAL_MBM]) {
+            printf("Signal: %.2f dBm\n", (float)nla_get_s32(bss_tb[NL80211_BSS_SIGNAL_MBM]) / 100.0);
+        }
+        
+        if (bss_tb[NL80211_BSS_STATUS]) {
+            uint32_t status_val = nla_get_u32(bss_tb[NL80211_BSS_STATUS]);
+            printf("Status: %u (", status_val);
+            if (status_val == NL80211_BSS_STATUS_ASSOCIATED) printf("Associated");
+            else if (status_val == NL80211_BSS_STATUS_AUTHENTICATED) printf("Authenticated");
+            else if (status_val == NL80211_BSS_STATUS_IBSS_JOINED) printf("IBSS Joined");
+            else printf("Other");
+            printf(")\n");
+        }
+
+        if (bss_tb[NL80211_BSS_INFORMATION_ELEMENTS]) {
+            unsigned char *ies_data = nla_data(bss_tb[NL80211_BSS_INFORMATION_ELEMENTS]);
+            int ies_len = nla_len(bss_tb[NL80211_BSS_INFORMATION_ELEMENTS]);
+            parse_ies(ies_data, ies_len, ssid_str, sizeof(ssid_str));
+            if (ssid_str[0] != '\0') {
+                printf("SSID: %s\n", ssid_str);
+            } else {
+                printf("SSID: (hidden or not found)\n");
+            }
+        }
+        // End of BSS parsing logic
+    } else if (gnlh->cmd == NL80211_CMD_NEW_SCAN_RESULTS && cb_data->scan_event_processed && !cb_data->dump_requested) {
+        // This case means we got the scan_finished_event, processed it, but the dump request inside the callback failed.
+        // The main loop should ideally detect this state via cb_data flags.
+        // No specific action here other than possibly logging.
+        printf("Callback: Received NEW_SCAN_RESULTS but dump was not successfully requested.\n");
+    }
+    // else {
+    //    printf("Callback: Received unhandled nl80211 command %d (nlmsg_type %d)\n", gnlh->cmd, nlh->nlmsg_type);
+    // }
+
+    return NL_OK; // Continue processing messages
 }
 
 static int get_ifindex(const char *ifname) {
@@ -173,6 +238,26 @@ int main(int argc, char **argv) {
         nl_socket_free(sk);
         return 1;
     }
+    printf("nl80211 family ID: %d\n", nl80211_id); // Re-added this line as per instruction context
+
+    // Resolve "scan" Multicast Group ID
+    int mc_scan_id = 0;
+    mc_scan_id = genl_ctrl_resolve_grp(sk, "nl80211", "scan");
+    if (mc_scan_id < 0) {
+        fprintf(stderr, "Failed to resolve nl80211 'scan' multicast group ID: %s\n", strerror(-mc_scan_id));
+        nl_socket_free(sk);
+        return 1;
+    }
+    printf("nl80211 'scan' multicast group ID: %d\n", mc_scan_id);
+
+    // Subscribe to Multicast Group
+    int ret_mc = nl_socket_add_memberships(sk, mc_scan_id, 0);
+    if (ret_mc < 0) {
+        fprintf(stderr, "Failed to subscribe to 'scan' multicast group: %s\n", strerror(-ret_mc));
+        nl_socket_free(sk);
+        return 1;
+    }
+    printf("Successfully subscribed to 'scan' multicast group.\n");
 
     // Get interface index
     int ifindex = 0;
@@ -185,6 +270,14 @@ int main(int argc, char **argv) {
     printf("Interface index for %s: %d\n", ifname, ifindex);
     // printf("nl80211 family ID: %d\n", nl80211_id); // Already have this, can be removed if noisy
     // printf("Scanning on interface: %s\n", ifname); // Already have this
+
+    struct callback_data cb_data = {
+        .sock = sk,
+        .nl80211_id = nl80211_id,
+        .ifindex = ifindex,
+        .scan_event_processed = 0,
+        .dump_requested = 0
+    };
 
     struct nl_msg *msg = NULL;
     int ret;
@@ -223,65 +316,55 @@ int main(int argc, char **argv) {
     // In a real application, wait for NL80211_CMD_NEW_SCAN_RESULTS event or use a timeout.
     // For simplicity, we proceed directly to fetching results. A small delay might be needed
     // on some systems if scans are not immediately available. sleep(2); // e.g.
-    printf("Waiting a moment for scan to initiate...\n");
+    // printf("Waiting a moment for scan to initiate...\n"); // Removed, new loop has its own message
 
+    // Register callback (moved after trigger, uses &cb_data)
+    nl_socket_modify_cb(sk, NL_CB_VALID, NL_CB_CUSTOM, scan_results_handler, &cb_data);
 
-    // 2. Register Callback for Scan Results
-    // The third argument is type, NL_CB_VALID means call for valid messages.
-    // The fourth argument is func, our handler.
-    // The fifth argument is arg, passed to the handler (NULL here).
-    nl_socket_modify_cb(sk, NL_CB_VALID, NL_CB_CUSTOM, scan_results_handler, NULL);
-
-    // 3. Get Scan Dump
-    msg = nlmsg_alloc(); // Re-allocate for the new message
-    if (!msg) {
-        fprintf(stderr, "Failed to allocate netlink message for get scan dump\n");
-        nl_socket_free(sk);
-        return 1;
-    }
-
-    if (!genlmsg_put(msg, NL_AUTO_PORT, NL_AUTO_SEQ, nl80211_id, 0,
-                     NLM_F_REQUEST | NLM_F_DUMP, NL80211_CMD_GET_SCAN, 0)) {
-        fprintf(stderr, "Failed to put genlmsg for get scan dump\n");
-        nlmsg_free(msg);
-        nl_socket_free(sk);
-        return 1;
-    }
-
-    if (nla_put_u32(msg, NL80211_ATTR_IFINDEX, ifindex) != 0) {
-        fprintf(stderr, "Failed to add ifindex attribute for get scan dump\n");
-        nlmsg_free(msg);
-        nl_socket_free(sk);
-        return 1;
-    }
-
-    ret = nl_send_auto(sk, msg); // msg is consumed
-    if (ret < 0) {
-        fprintf(stderr, "Failed to send get scan dump message: %s\n", strerror(-ret));
-        nl_socket_free(sk);
-        return 1;
-    }
-    // Not freeing msg here.
-    printf("Scan dump request sent.\n");
-
-    // 4. Receive Messages
+    // New Main Receive Loop
+    printf("Waiting for scan finished event...\n");
     int recv_ret;
-    printf("Listening for scan results...\n");
-    while ((recv_ret = nl_recvmsgs_default(sk)) > 0) {
-        // Callback scan_results_handler is processing messages
-        // Loop continues as long as messages are processed successfully
-    }
-    if (recv_ret < 0) {
-        // Check if the error is NL_STOP, which means our callback stopped processing.
-        // This is not an error in itself if the callback decided to stop.
-        // However, other negative values are actual errors.
-        if (recv_ret != -NLE_STOP) { // NLE_STOP is libnl's equivalent for NL_STOP from callback
-             fprintf(stderr, "nl_recvmsgs_default failed: %s (%d)\n", strerror(-recv_ret), -recv_ret);
-             nl_socket_free(sk);
-             return 1;
+    // Loop while the scan event hasn't been processed OR 
+    // while a dump has been requested but hasn't completed (signaled by NL_STOP from callback).
+    // The callback returns NL_STOP on NLMSG_DONE, which causes nl_recvmsgs_default to return an error code NL_STOPPED.
+    while (!cb_data.scan_event_processed || cb_data.dump_requested) {
+        recv_ret = nl_recvmsgs_default(sk);
+        if (recv_ret < 0) {
+            if (recv_ret == NL_STOPPED) { // NL_STOPPED means callback returned NL_STOP
+                printf("Main: Receiver stopped by callback (NL_STOP), likely scan dump complete.\n");
+                // If dump was requested and we got NL_STOP, it means NLMSG_DONE was handled.
+                // Reset dump_requested as callback would have done if it saw NLMSG_DONE.
+                if (cb_data.dump_requested) cb_data.dump_requested = 0; 
+                break; 
+            }
+            // For blocking sockets, NLE_AGAIN is not expected unless some timeout was set on the socket.
+            // Treat other negative values as errors.
+            fprintf(stderr, "Main: nl_recvmsgs_default error: %s\n", nl_geterror(recv_ret)); // Using nl_geterror
+            break; 
         }
+        if (recv_ret == 0 && !cb_data.scan_event_processed) {
+             // For a blocking socket, recv_ret=0 typically means the peer has closed the connection.
+             // This is unexpected in this Netlink scenario before scan event.
+             fprintf(stderr, "Main: No message received (recv_ret=0) and scan event not processed. Peer closed? Exiting.\n");
+             break;
+        }
+        // If scan_event_processed becomes true, and dump_requested becomes true, 
+        // the loop continues until the callback returns NL_STOP (on NLMSG_DONE).
+        // If scan_event_processed is true, but dump_requested is false (meaning dump send failed in callback),
+        // this loop will also exit because !cb_data.dump_requested will be false.
     }
-    printf("Finished processing scan results.\n");
+
+    // After the loop, check the final state of flags
+    if (!cb_data.scan_event_processed) {
+        fprintf(stderr, "Main: Scan finished event was not received or failed to process.\n");
+    } else if (cb_data.scan_event_processed && !cb_data.dump_requested && !(recv_ret == NL_STOPPED && !cb_data.dump_requested)) {
+        // This condition means:
+        // scan event was processed (so dump *should* have been requested)
+        // AND dump_requested is FALSE (meaning sending dump_msg failed in callback)
+        // AND it's not the case that we stopped normally after a successful dump (where dump_requested would be reset by NL_STOPPED logic)
+        fprintf(stderr, "Main: Scan dump request may have failed in callback, or no BSS entries found after dump.\n");
+    }
+    printf("Main: Finished listening for scan results.\n");
 
     nl_socket_free(sk); // Cleanup socket
     return 0;

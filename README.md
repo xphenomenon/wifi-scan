@@ -74,4 +74,5 @@ Finished processing scan results.
 
 *   The program includes basic error handling. If it fails at a certain step, it will print an error message to `stderr`.
 *   The parsing of Information Elements (IEs) for SSID extraction is a simplified example.
-*   For a production application, more robust error checking, asynchronous event handling (especially for scan completion via `NL80211_CMD_NEW_SCAN_RESULTS`), and more comprehensive IE parsing would be necessary.
+*   This version uses multicast notifications (NL80211_CMD_NEW_SCAN_RESULTS event) to detect scan completion before fetching the full results, which is a more robust approach than simple timed dumps.
+*   Further improvements for production could include more comprehensive IE parsing and even more sophisticated error handling.
