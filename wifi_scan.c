@@ -9,7 +9,7 @@
 #include <netlink/genl/ctrl.h>
 #include <linux/nl80211.h>
 #include <netlink/attr.h> // Needed for nla_parse, nla_data, etc.
-#include <netlink/error.h> // For nl_geterror()
+/* #include <netlink/error.h> // For nl_geterror() */
 
 struct callback_data {
     struct nl_sock *sock;       // Netlink socket for sending messages from callback
@@ -330,7 +330,7 @@ int main(int argc, char **argv) {
     while (!cb_data.scan_event_processed || cb_data.dump_requested) {
         recv_ret = nl_recvmsgs_default(sk);
         if (recv_ret < 0) {
-            if (recv_ret == NL_STOPPED) { // NL_STOPPED means callback returned NL_STOP
+            if (recv_ret == NL_STOP) { // NL_STOPPED means callback returned NL_STOP
                 printf("Main: Receiver stopped by callback (NL_STOP), likely scan dump complete.\n");
                 // If dump was requested and we got NL_STOP, it means NLMSG_DONE was handled.
                 // Reset dump_requested as callback would have done if it saw NLMSG_DONE.
@@ -357,7 +357,7 @@ int main(int argc, char **argv) {
     // After the loop, check the final state of flags
     if (!cb_data.scan_event_processed) {
         fprintf(stderr, "Main: Scan finished event was not received or failed to process.\n");
-    } else if (cb_data.scan_event_processed && !cb_data.dump_requested && !(recv_ret == NL_STOPPED && !cb_data.dump_requested)) {
+    } else if (cb_data.scan_event_processed && !cb_data.dump_requested && !(recv_ret == NL_STOP && !cb_data.dump_requested)) {
         // This condition means:
         // scan event was processed (so dump *should* have been requested)
         // AND dump_requested is FALSE (meaning sending dump_msg failed in callback)
